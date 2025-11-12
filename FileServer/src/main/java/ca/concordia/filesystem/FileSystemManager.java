@@ -3,14 +3,15 @@ package ca.concordia.filesystem;
 import ca.concordia.filesystem.datastructures.FEntry;
 import java.io.RandomAccessFile;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 public class FileSystemManager {
-
     private final int MAXFILES = 5;
     private final int MAXBLOCKS = 10;
     private static FileSystemManager instance; // singleton
     private final RandomAccessFile disk;
     private final ReentrantLock globalLock = new ReentrantLock();
+    private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
 
     private static final int BLOCK_SIZE = 128; // Example block size
 
@@ -50,7 +51,7 @@ public class FileSystemManager {
 
     // ==================== CREATE FILE ====================
     public void createFile(String fileName) throws Exception {
-        globalLock.lock();
+        lock.writeLock().lock();
         try {
             if (fileName.length() > 11)
                 throw new Exception("ERROR: filename too large");
@@ -71,13 +72,14 @@ public class FileSystemManager {
 
             throw new Exception("ERROR: maximum file limit reached");
         } finally {
-            globalLock.unlock();
+            lock.writeLock().unlock();
+
         }
     }
 
     // ==================== WRITE FILE ====================
     public void writeFile(String fileName, byte[] data) throws Exception {
-        globalLock.lock();
+         lock.writeLock().lock();
         try {
             FEntry entry = findEntry(fileName);
             if (entry == null) throw new Exception("ERROR: file does not exist");
@@ -110,13 +112,14 @@ public class FileSystemManager {
 
             System.out.println("[WRITE] " + fileName + " (" + data.length + " bytes, " + requiredBlocks + " blocks)");
         } finally {
-            globalLock.unlock();
+            lock.writeLock().unlock();
+
         }
     }
 
     // ==================== READ FILE ====================
     public byte[] readFile(String fileName) throws Exception {
-        globalLock.lock();
+        lock.readLock().lock();
         try {
             FEntry entry = findEntry(fileName);
             if (entry == null) throw new Exception("ERROR: file does not exist");
@@ -135,13 +138,15 @@ public class FileSystemManager {
             System.out.println("[READ] " + fileName + " (" + buffer.length + " bytes)");
             return buffer;
         } finally {
-            globalLock.unlock();
+            lock.readLock().unlock();
+
         }
     }
 
     // ==================== DELETE FILE ====================
     public void deleteFile(String fileName) throws Exception {
-        globalLock.lock();
+        lock.writeLock().lock();
+
         try {
             for (int i = 0; i < MAXFILES; i++) {
                 FEntry entry = inodeTable[i];
@@ -154,13 +159,14 @@ public class FileSystemManager {
             }
             throw new Exception("ERROR: file " + fileName + " does not exist");
         } finally {
-            globalLock.unlock();
+            lock.writeLock().unlock();
+
         }
     }
 
     // ==================== LIST FILES ====================
     public String[] listFiles() {
-        globalLock.lock();
+        lock.readLock().lock();
         try {
             java.util.List<String> names = new java.util.ArrayList<>();
             for (FEntry e : inodeTable)
@@ -168,7 +174,8 @@ public class FileSystemManager {
                     names.add(e.getFilename());
             return names.toArray(new String[0]);
         } finally {
-            globalLock.unlock();
+            lock.readLock().unlock();
+
         }
     }
 
