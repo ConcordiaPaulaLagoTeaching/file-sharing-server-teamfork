@@ -27,7 +27,6 @@ public class FileServer {
         if (running) return;
         running = true;
 
-        // Named thread factory for easier debugging
         ThreadFactory tf = new ThreadFactory() {
             private final AtomicInteger c = new AtomicInteger(1);
             @Override public Thread newThread(Runnable r) {
@@ -37,7 +36,6 @@ public class FileServer {
             }
         };
 
-        // Bounded queue + backpressure to avoid OOM under load
         BlockingQueue<Runnable> q = new ArrayBlockingQueue<>(cfg.queueCapacity);
 
         pool = new ThreadPoolExecutor(
@@ -46,7 +44,7 @@ public class FileServer {
                 cfg.keepAliveMillis, TimeUnit.MILLISECONDS,
                 q,
                 tf,
-                new ThreadPoolExecutor.AbortPolicy() // we'll handle rejection at submit time
+                new ThreadPoolExecutor.AbortPolicy()
         );
         pool.allowCoreThreadTimeOut(true);
 
@@ -57,25 +55,21 @@ public class FileServer {
                     " | pool " + cfg.coreThreads + "/" + cfg.maxThreads +
                     " | queue " + cfg.queueCapacity);
 
-            // Graceful shutdown hook
             Runtime.getRuntime().addShutdownHook(new Thread(this::shutdown, "server-shutdown"));
 
-            // Accept loop
             while (running) {
                 try {
                     Socket client = ss.accept();
                     client.setSoTimeout(cfg.clientSoTimeoutMillis);
 
                     try {
-                        pool.execute(new ClientHandler(client, fs));
+                        // pass cfg so ClientHandler enforces error-handling limits
+                        pool.execute(new ClientHandler(client, fs, cfg));
                     } catch (RejectedExecutionException rex) {
-                        // Backpressure: pool saturated – respond and close quickly
                         ClientHandler.respondAndClose(client, "ERROR server busy, try again later");
                     }
                 } catch (IOException e) {
-                    if (running) {
-                        System.err.println("[Server] Accept error: " + e.getMessage());
-                    }
+                    if (running) System.err.println("[Server] Accept error: " + e.getMessage());
                 }
             }
         } catch (IOException e) {
