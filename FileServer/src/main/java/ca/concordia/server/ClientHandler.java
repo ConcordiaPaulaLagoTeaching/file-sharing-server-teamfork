@@ -6,15 +6,7 @@ import java.io.*;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.Locale;
-
-/**
- * Handles exactly one client connection.
- * Error handling policy (Task 4):
- *  - Parse each line as one command.
- *  - On any command error: reply "ERROR <reason>" and CONTINUE reading next command.
- *  - Only close on QUIT, EOF, or fatal I/O.
- *  - Other clients are unaffected because each connection runs in its own worker.
- */
+ 
 public class ClientHandler implements Runnable {
 
     private final Socket socket;
