@@ -11,24 +11,8 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
-/**
- * Tiny on-disk filesystem with explicit FEntry[] and FNode[] arrays.
- *
- * Readers–writer rules for Task 3:
- *  - Many concurrent readers: readFile(), listFiles() use rw.readLock()
- *  - Single writer with mutual exclusion: createFile(), writeFile(), deleteFile() use rw.writeLock()
- *  - Fair lock prevents starvation of writers or readers during heavy traffic.
- *
- * Deadlock prevention:
- *  - Exactly one internal lock (rw); no nested lock ordering issues
- *  - Always unlock in finally blocks
- *  - No callbacks while holding locks; only internal I/O to our own RandomAccessFile
- */
 public class FileSystemManager {
 
-    // ======= Test hook for Task 3 demo (optional) =======
-    // If > 0, writeFile() will sleep this many milliseconds while holding the write lock,
-    // making it easy to see readers block behind a writer during the demo harness.
     public static volatile int TEST_IN_WRITE_DELAY_MS = 0;
 
     // ---- header constants ----
