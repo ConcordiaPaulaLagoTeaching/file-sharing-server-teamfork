@@ -12,28 +12,24 @@ import java.util.Arrays;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
- * A tiny filesystem inside one RandomAccessFile with explicit FEntry[] and FNode[] on disk.
+ * Tiny on-disk filesystem with explicit FEntry[] and FNode[] arrays.
  *
- * Disk layout (little endian):
- *   Header (24 bytes):
- *     [0x00] 4  MAGIC = 'FSV2' (0x46535632)
- *     [0x04] 4  totalBytes
- *     [0x08] 4  blockSize
- *     [0x0C] 4  maxFiles
- *     [0x10] 4  maxBlocks
- *     [0x14] 4  reserved = 0
- *   FEntry region = maxFiles * 16 bytes (filename[12] + size(2) + firstBlock(2))
- *   FNode  region = maxBlocks * 4 bytes (blockIndex(2) + nextIndex(2))
- *   Data   region = maxBlocks * blockSize bytes
+ * Readers–writer rules for Task 3:
+ *  - Many concurrent readers: readFile(), listFiles() use rw.readLock()
+ *  - Single writer with mutual exclusion: createFile(), writeFile(), deleteFile() use rw.writeLock()
+ *  - Fair lock prevents starvation of writers or readers during heavy traffic.
  *
- * Task-1 guarantees implemented:
- *  - Works for any positive valid BLOCKSIZE / MAXFILES / MAXBLOCKS the caller supplies (fits in totalBytes).
- *  - createFile / deleteFile / writeFile / readFile / listFiles.
- *  - deleteFile zero-fills all blocks in the chain (privacy).
- *  - writeFile is all-or-nothing: on any error, we rollback newly allocated nodes and leave FS unchanged.
- *  - No partial reads/writes beyond file size.
+ * Deadlock prevention:
+ *  - Exactly one internal lock (rw); no nested lock ordering issues
+ *  - Always unlock in finally blocks
+ *  - No callbacks while holding locks; only internal I/O to our own RandomAccessFile
  */
 public class FileSystemManager {
+
+    // ======= Test hook for Task 3 demo (optional) =======
+    // If > 0, writeFile() will sleep this many milliseconds while holding the write lock,
+    // making it easy to see readers block behind a writer during the demo harness.
+    public static volatile int TEST_IN_WRITE_DELAY_MS = 0;
 
     // ---- header constants ----
     private static final int MAGIC = 0x46535632; // "FSV2"
@@ -48,7 +44,7 @@ public class FileSystemManager {
     private final int maxFiles;
     private final int maxBlocks;
 
-    // ---- locks: many readers, single writer ----
+    // ---- locks: many readers, single writer (fair) ----
     private final ReentrantReadWriteLock rw = new ReentrantReadWriteLock(true);
 
     // ---- file handle ----
@@ -67,7 +63,6 @@ public class FileSystemManager {
         if (totalBytes <= 0 || blockSize <= 0 || maxFiles <= 0 || maxBlocks <= 0)
             throw new IllegalArgumentException("All parameters must be positive");
 
-        // Ensure layout fits
         long need = HEADER_BYTES
                 + (long) FENTRY_BYTES * maxFiles
                 + (long) FNODE_BYTES  * maxBlocks
@@ -95,7 +90,6 @@ public class FileSystemManager {
             if (!exists || disk.length() < totalBytes) disk.setLength(totalBytes);
 
             if (!exists) {
-                // Fresh format
                 for (int i = 0; i < maxFiles; i++) entries[i] = new FEntry();
                 for (short i = 0; i < maxBlocks; i++) {
                     FNode n = new FNode();
@@ -109,7 +103,6 @@ public class FileSystemManager {
                 zeroAllData();
             } else {
                 if (!tryLoadHeader()) {
-                    // Reinitialize (if magic mismatched)
                     for (int i = 0; i < maxFiles; i++) entries[i] = new FEntry();
                     for (short i = 0; i < maxBlocks; i++) {
                         FNode n = new FNode();
@@ -131,7 +124,7 @@ public class FileSystemManager {
         }
     }
 
-    // ======================== Public API (Task 1) ========================
+    // ======================== Public API ========================
 
     public void createFile(String filename) throws Exception {
         rw.writeLock().lock();
@@ -160,14 +153,11 @@ public class FileSystemManager {
 
             short head = e.getFirstBlock();
             if (head >= 0) {
-                // zero and free chain
                 var chain = followChain(head);
                 for (short b : chain) zeroBlock(b);
                 freeChain(head);
                 flushAllFNodes();
             }
-
-            // clear entry
             entries[idx] = new FEntry();
             flushEntry(idx);
         } finally {
@@ -180,11 +170,15 @@ public class FileSystemManager {
         ArrayList<Short> newly = new ArrayList<>();
         boolean committed = false;
         try {
+            // ---- Task 3 hook: simulate a long write while holding the write lock ----
+            if (TEST_IN_WRITE_DELAY_MS > 0) {
+                try { Thread.sleep(TEST_IN_WRITE_DELAY_MS); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+            }
+
             int idx = findEntryIndex(filename);
             if (idx < 0) throw new Exception("file not found");
             FEntry e = entries[idx];
 
-            // Plan: allocate new chain first (ensures no partial updates); write all data; atomically swap entry; then free old.
             int newSize = Math.min(contents == null ? 0 : contents.length, 0xFFFF);
             int neededBlocks = (newSize == 0) ? 0 : (int)Math.ceil((double)newSize / blockSize);
 
@@ -192,30 +186,24 @@ public class FileSystemManager {
             if (neededBlocks > 0) {
                 if (countFreeNodes() < neededBlocks) throw new Exception("insufficient free blocks");
 
-                // allocate and write
                 short prev = -1;
                 int written = 0;
                 for (int i = 0; i < neededBlocks; i++) {
                     short node = allocFreeNode();
                     newly.add(node);
-                    // For clarity: node index equals data block index 1:1.
-                    // Mark TEMP end now; we'll fix links as we go.
                     fnodes[node].setNextIndex(FNode.END);
 
-                    // write data portion
                     int chunk = Math.min(blockSize, newSize - written);
                     writeBlock(node, contents, written, chunk);
                     if (chunk < blockSize) zeroTail(node, chunk);
                     written += chunk;
 
-                    // chain
                     if (prev == -1) newHead = node;
                     else fnodes[prev].setNextIndex(node);
                     prev = node;
                 }
             }
 
-            // persist new nodes first, then entry (commit point)
             flushAllFNodes();
             short oldHead = e.getFirstBlock();
             e.setUnsignedSize(newSize);
@@ -223,7 +211,6 @@ public class FileSystemManager {
             flushEntry(idx);
             committed = true;
 
-            // after commit, free old chain
             if (oldHead >= 0) {
                 var oldChain = followChain(oldHead);
                 for (short b : oldChain) zeroBlock(b);
@@ -231,7 +218,6 @@ public class FileSystemManager {
                 flushAllFNodes();
             }
         } catch (Exception ex) {
-            // rollback any newly allocated nodes (only if not committed)
             if (!committed && !newly.isEmpty()) {
                 try {
                     for (short n : newly) {
@@ -239,7 +225,7 @@ public class FileSystemManager {
                         fnodes[n].setNextIndex(FNode.FREE);
                     }
                     flushAllFNodes();
-                } catch (IOException ignored) { /* best effort */ }
+                } catch (IOException ignored) { }
             }
             throw ex;
         } finally {
@@ -319,7 +305,7 @@ public class FileSystemManager {
         for (short i = 0; i < fnodes.length; i++) {
             if (fnodes[i].getNextIndex() == FNode.FREE) {
                 fnodes[i].setBlockIndex(i);
-                fnodes[i].setNextIndex(FNode.END); // claimed
+                fnodes[i].setNextIndex(FNode.END);
                 return i;
             }
         }
@@ -356,7 +342,7 @@ public class FileSystemManager {
         bb.putInt(blockSize);
         bb.putInt(maxFiles);
         bb.putInt(maxBlocks);
-        bb.putInt(0); // reserved
+        bb.putInt(0);
         disk.seek(0);
         disk.write(bb.array());
     }
@@ -373,7 +359,7 @@ public class FileSystemManager {
         int bS = bb.getInt();
         int mF = bb.getInt();
         int mB = bb.getInt();
-        /* reserved */ bb.getInt();
+        bb.getInt(); // reserved
         return magic == MAGIC && tB == totalBytes && bS == blockSize && mF == maxFiles && mB == maxBlocks;
     }
 
@@ -387,17 +373,14 @@ public class FileSystemManager {
         long pos = entriesOff + (long)i * FENTRY_BYTES;
         disk.seek(pos);
 
-        // name: 12 bytes ASCII, NUL padded
         byte[] name = new byte[12];
         if (!e.isFree()) {
             byte[] src = e.getFilename().getBytes(StandardCharsets.US_ASCII);
             int n = Math.min(src.length, 11);
             System.arraycopy(src, 0, name, 0, n);
-            // trailing zeros already there
         }
         disk.write(name);
 
-        // size + firstBlock
         ByteBuffer mb = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN);
         mb.putShort((short)(e.getRawSize() & 0xFFFF));
         mb.putShort(e.getFirstBlock());
