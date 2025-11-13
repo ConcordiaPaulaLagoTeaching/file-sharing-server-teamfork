@@ -1,12 +1,34 @@
 package ca.concordia.filesystem.datastructures;
 
+/**
+ * On-disk node describing one data block and the link to the next block.
+ * Exactly 4 bytes on disk:
+ *   blockIndex : short  (0..MAXBLOCKS-1)   // index of the data block
+ *   nextIndex  : short  (-1=FREE, -2=END, >=0 next)
+ *
+ * Each FNode corresponds 1:1 to a data block slot.
+ */
 public class FNode {
+    public static final short FREE = (short) -1;
+    public static final short END  = (short) -2;
 
-    private int blockIndex;
-    private int next;
+    private short blockIndex;
+    private short nextIndex;
 
-    public FNode(int blockIndex) {
+    public FNode(short blockIndex, short nextIndex) {
         this.blockIndex = blockIndex;
-        this.next = -1;
+        this.nextIndex = nextIndex;
     }
+    public FNode() {
+        this.blockIndex = -1;
+        this.nextIndex = FREE;
+    }
+
+    public short getBlockIndex() { return blockIndex; }
+    public short getNextIndex()  { return nextIndex;  }
+
+    public void setBlockIndex(short i) { this.blockIndex = i; }
+    public void setNextIndex(short n)  { this.nextIndex  = n; }
+
+    public boolean isFree() { return nextIndex == FREE; }
 }

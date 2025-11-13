@@ -1,92 +1,41 @@
 package ca.concordia.filesystem.datastructures;
 
-import java.util.LinkedList;
-
+/**
+ * On-disk file entry
+ * - filename: <= 11 ASCII chars (12 bytes reserved incl. NUL padding)
+ * - size: unsigned short (0..65535)
+ * - firstBlock: short index of head node (-1 if none)
+ * Exactly 16 bytes on disk.
+ */
 public class FEntry {
+    private String filename;     // empty => free slot
+    private short size;          // store as short; interpret with Short.toUnsignedInt
+    private short firstBlock;    // -1 if none
 
-    private String filename;          // name of the file
-    private short filesize;           // size of file in bytes
-    private short firstBlock;         // first block index
-    private LinkedList<Short> blockChain; // all blocks belonging to this file
-
-    public FEntry(String filename, short filesize, short firstBlock) {
-        if (filename.length() > 11)
-            throw new IllegalArgumentException("Filename cannot be longer than 11 characters.");
-
-        this.filename = filename;
-        this.filesize = filesize;
-        this.firstBlock = firstBlock;
-        this.blockChain = new LinkedList<>();
-
-        if (firstBlock >= 0)
-            this.blockChain.add(firstBlock);
+    public FEntry() {
+        this.filename = "";
+        this.size = 0;
+        this.firstBlock = -1;
     }
 
-    // ==================== Getters ====================
     public String getFilename() { return filename; }
-    public int getSize() { return filesize; }
-    public short getFilesize() { return filesize; }
+    public int getUnsignedSize() { return Short.toUnsignedInt(size); }
+    public short getRawSize() { return size; }
     public short getFirstBlock() { return firstBlock; }
-    public LinkedList<Short> getBlockChain() { return blockChain; }
+    public boolean isFree() { return filename == null || filename.isEmpty(); }
 
-    // ==================== Setters ====================
-    public void setFilename(String filename) {
-        if (filename.length() > 11)
-            throw new IllegalArgumentException("Filename cannot be longer than 11 characters.");
-        this.filename = filename;
+    public void setFilename(String name) {
+        if (name == null) name = "";
+        if (name.length() > 11) throw new IllegalArgumentException("filename > 11 chars");
+        this.filename = name;
     }
-
-    public void setFilesize(short filesize) {
-        if (filesize < 0)
-            throw new IllegalArgumentException("Filesize cannot be negative.");
-        this.filesize = filesize;
+    public void setUnsignedSize(int sz) {
+        if (sz < 0 || sz > 0xFFFF) throw new IllegalArgumentException("size out of range (0..65535)");
+        this.size = (short) (sz & 0xFFFF);
     }
+    public void setFirstBlock(short fb) { this.firstBlock = fb; }
 
-    public void setSize(int size) {
-        if (size < 0 || size > Short.MAX_VALUE)
-            throw new IllegalArgumentException("Invalid file size value.");
-        this.filesize = (short) size;
-    }
-
-    public void setFirstBlock(int firstBlock) {
-        if (firstBlock < -1)
-            throw new IllegalArgumentException("Invalid block index.");
-        this.firstBlock = (short) firstBlock;
-
-        if (firstBlock >= 0) {
-            if (blockChain.isEmpty())
-                blockChain.add((short) firstBlock);
-            else
-                blockChain.set(0, (short) firstBlock);
-        } else {
-            blockChain.clear();
-        }
-    }
-
-    // ==================== LinkedList Helpers ====================
-    public void addBlock(short blockIndex) {
-        if (!blockChain.contains(blockIndex))
-            blockChain.add(blockIndex);
-    }
-
-    public void clearBlocks() {
-        blockChain.clear();
-        firstBlock = -1;
-        filesize = 0;
-    }
-
-    public int getBlockCount() {
-        return blockChain.size();
-    }
-
-    // ==================== Utility ====================
-    @Override
-    public String toString() {
-        return "FEntry{" +
-                "filename='" + filename + '\'' +
-                ", filesize=" + filesize +
-                ", firstBlock=" + firstBlock +
-                ", blockChain=" + blockChain +
-                '}';
+    @Override public String toString() {
+        return "FEntry{'" + filename + "', size=" + getUnsignedSize() + ", first=" + firstBlock + "}";
     }
 }

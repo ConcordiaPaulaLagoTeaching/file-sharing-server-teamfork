@@ -1,213 +1,494 @@
 package ca.concordia.filesystem;
 
 import ca.concordia.filesystem.datastructures.FEntry;
-import java.io.RandomAccessFile;
-import java.util.concurrent.locks.ReentrantLock;
+import ca.concordia.filesystem.datastructures.FNode;
+
+import java.io.*;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
+/**
+ * A tiny filesystem inside one RandomAccessFile with explicit FEntry[] and FNode[] on disk.
+ *
+ * Disk layout (little endian):
+ *   Header (24 bytes):
+ *     [0x00] 4  MAGIC = 'FSV2' (0x46535632)
+ *     [0x04] 4  totalBytes
+ *     [0x08] 4  blockSize
+ *     [0x0C] 4  maxFiles
+ *     [0x10] 4  maxBlocks
+ *     [0x14] 4  reserved = 0
+ *   FEntry region = maxFiles * 16 bytes (filename[12] + size(2) + firstBlock(2))
+ *   FNode  region = maxBlocks * 4 bytes (blockIndex(2) + nextIndex(2))
+ *   Data   region = maxBlocks * blockSize bytes
+ *
+ * Task-1 guarantees implemented:
+ *  - Works for any positive valid BLOCKSIZE / MAXFILES / MAXBLOCKS the caller supplies (fits in totalBytes).
+ *  - createFile / deleteFile / writeFile / readFile / listFiles.
+ *  - deleteFile zero-fills all blocks in the chain (privacy).
+ *  - writeFile is all-or-nothing: on any error, we rollback newly allocated nodes and leave FS unchanged.
+ *  - No partial reads/writes beyond file size.
+ */
 public class FileSystemManager {
-    private final int MAXFILES = 5;
-    private final int MAXBLOCKS = 10;
-    private static FileSystemManager instance; // singleton
+
+    // ---- header constants ----
+    private static final int MAGIC = 0x46535632; // "FSV2"
+    private static final int HEADER_BYTES = 24;
+    private static final int FENTRY_BYTES = 16; // 12 name + 2 size + 2 first
+    private static final int FNODE_BYTES  = 4;  // 2 blockIndex + 2 nextIndex
+
+    // ---- persistent config ----
+    private final String path;
+    private final int totalBytes;
+    private final int blockSize;
+    private final int maxFiles;
+    private final int maxBlocks;
+
+    // ---- locks: many readers, single writer ----
+    private final ReentrantReadWriteLock rw = new ReentrantReadWriteLock(true);
+
+    // ---- file handle ----
     private final RandomAccessFile disk;
-    private final ReentrantLock globalLock = new ReentrantLock();
-    private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
 
-    private static final int BLOCK_SIZE = 128; // Example block size
+    // ---- in-memory mirrors ----
+    private final FEntry[] entries;
+    private final FNode[]  fnodes;
 
-    private FEntry[] inodeTable; // Array of inodes
-    private boolean[] freeBlockList; // Bitmap for free blocks
+    // ---- computed offsets ----
+    private final long entriesOff;
+    private final long fnodesOff;
+    private final long dataOff;
 
-    // ==================== CONSTRUCTOR ====================
-    public FileSystemManager(String filename, int totalSize) {
-        if (instance == null) {
-            try {
-                // 1. Create or open the disk file
-                disk = new RandomAccessFile(filename, "rw");
+    public FileSystemManager(String diskPath, int totalBytes, int blockSize, int maxFiles, int maxBlocks) {
+        if (totalBytes <= 0 || blockSize <= 0 || maxFiles <= 0 || maxBlocks <= 0)
+            throw new IllegalArgumentException("All parameters must be positive");
 
-                // 2. Ensure the file has the correct size (totalSize bytes)
-                if (disk.length() < totalSize) {
-                    disk.setLength(totalSize);
-                }
+        // Ensure layout fits
+        long need = HEADER_BYTES
+                + (long) FENTRY_BYTES * maxFiles
+                + (long) FNODE_BYTES  * maxBlocks
+                + (long) blockSize    * maxBlocks;
+        if (need > totalBytes)
+            throw new IllegalArgumentException("totalBytes too small for given BLOCKSIZE/MAXFILES/MAXBLOCKS");
 
-                // 3. Initialize metadata
-                inodeTable = new FEntry[MAXFILES];
-                freeBlockList = new boolean[MAXBLOCKS];
-                for (int i = 0; i < MAXBLOCKS; i++) {
-                    freeBlockList[i] = true; // all blocks free
-                }
+        this.path = diskPath;
+        this.totalBytes = totalBytes;
+        this.blockSize = blockSize;
+        this.maxFiles  = maxFiles;
+        this.maxBlocks = maxBlocks;
 
-                instance = this;
-                System.out.println("File system initialized: " + filename);
-                System.out.println("Disk size: " + totalSize + " bytes");
-                System.out.println("Max files: " + MAXFILES + ", Max blocks: " + MAXBLOCKS);
-            } catch (Exception e) {
-                throw new RuntimeException("Failed to initialize FileSystemManager: " + e.getMessage(), e);
-            }
-        } else {
-            throw new IllegalStateException("FileSystemManager is already initialized.");
-        }
-    }
+        this.entries = new FEntry[maxFiles];
+        this.fnodes  = new FNode[maxBlocks];
 
-    // ==================== CREATE FILE ====================
-    public void createFile(String fileName) throws Exception {
-        lock.writeLock().lock();
-        try {
-            if (fileName.length() > 11)
-                throw new Exception("ERROR: filename too large");
-
-            // Check if file already exists
-            for (FEntry entry : inodeTable)
-                if (entry != null && fileName.equals(entry.getFilename()))
-                    throw new Exception("ERROR: file already exists");
-
-            // Find a free inode slot
-            for (int i = 0; i < MAXFILES; i++) {
-                if (inodeTable[i] == null) {
-                    inodeTable[i] = new FEntry(fileName, (short) 0, (short) -1);
-                    System.out.println("[CREATE] File created: " + fileName);
-                    return;
-                }
-            }
-
-            throw new Exception("ERROR: maximum file limit reached");
-        } finally {
-            lock.writeLock().unlock();
-
-        }
-    }
-
-    // ==================== WRITE FILE ====================
-    public void writeFile(String fileName, byte[] data) throws Exception {
-         lock.writeLock().lock();
-        try {
-            FEntry entry = findEntry(fileName);
-            if (entry == null) throw new Exception("ERROR: file does not exist");
-
-            int requiredBlocks = (int) Math.ceil(data.length / (double) BLOCK_SIZE);
-            if (countFreeBlocks() < requiredBlocks)
-                throw new Exception("ERROR: not enough space to write file");
-
-            // Clear old blocks if file already had content
-            clearBlocks(entry);
-
-            // Write new data
-            int offset = 0;
-            for (int i = 0; i < requiredBlocks; i++) {
-                int freeBlock = getFreeBlock();
-                freeBlockList[freeBlock] = false;
-                entry.addBlock((short) freeBlock);
-
-                int toWrite = Math.min(BLOCK_SIZE, data.length - offset);
-                disk.seek((long) freeBlock * BLOCK_SIZE);
-                disk.write(data, offset, toWrite);
-                offset += toWrite;
-            }
-
-            // Update metadata
-            if (!entry.getBlockChain().isEmpty()) {
-                entry.setFirstBlock(entry.getBlockChain().getFirst());
-            }
-            entry.setSize(data.length);
-
-            System.out.println("[WRITE] " + fileName + " (" + data.length + " bytes, " + requiredBlocks + " blocks)");
-        } finally {
-            lock.writeLock().unlock();
-
-        }
-    }
-
-    // ==================== READ FILE ====================
-    public byte[] readFile(String fileName) throws Exception {
-        lock.readLock().lock();
-        try {
-            FEntry entry = findEntry(fileName);
-            if (entry == null) throw new Exception("ERROR: file does not exist");
-            if (entry.getFirstBlock() == -1) throw new Exception("ERROR: file is empty");
-
-            byte[] buffer = new byte[entry.getSize()];
-            int bytesRead = 0;
-
-            for (short block : entry.getBlockChain()) {
-                int toRead = Math.min(BLOCK_SIZE, buffer.length - bytesRead);
-                disk.seek((long) block * BLOCK_SIZE);
-                disk.read(buffer, bytesRead, toRead);
-                bytesRead += toRead;
-            }
-
-            System.out.println("[READ] " + fileName + " (" + buffer.length + " bytes)");
-            return buffer;
-        } finally {
-            lock.readLock().unlock();
-
-        }
-    }
-
-    // ==================== DELETE FILE ====================
-    public void deleteFile(String fileName) throws Exception {
-        lock.writeLock().lock();
+        this.entriesOff = HEADER_BYTES;
+        this.fnodesOff  = entriesOff + (long)FENTRY_BYTES * maxFiles;
+        this.dataOff    = fnodesOff  + (long)FNODE_BYTES  * maxBlocks;
 
         try {
-            for (int i = 0; i < MAXFILES; i++) {
-                FEntry entry = inodeTable[i];
-                if (entry != null && fileName.equals(entry.getFilename())) {
-                    clearBlocks(entry);
-                    inodeTable[i] = null;
-                    System.out.println("[DELETE] " + fileName + " deleted.");
-                    return;
+            File f = new File(path);
+            boolean exists = f.exists();
+            this.disk = new RandomAccessFile(f, "rw");
+            if (!exists || disk.length() < totalBytes) disk.setLength(totalBytes);
+
+            if (!exists) {
+                // Fresh format
+                for (int i = 0; i < maxFiles; i++) entries[i] = new FEntry();
+                for (short i = 0; i < maxBlocks; i++) {
+                    FNode n = new FNode();
+                    n.setBlockIndex(i);
+                    n.setNextIndex(FNode.FREE);
+                    fnodes[i] = n;
+                }
+                writeHeader();
+                flushAllEntries();
+                flushAllFNodes();
+                zeroAllData();
+            } else {
+                if (!tryLoadHeader()) {
+                    // Reinitialize (if magic mismatched)
+                    for (int i = 0; i < maxFiles; i++) entries[i] = new FEntry();
+                    for (short i = 0; i < maxBlocks; i++) {
+                        FNode n = new FNode();
+                        n.setBlockIndex(i);
+                        n.setNextIndex(FNode.FREE);
+                        fnodes[i] = n;
+                    }
+                    writeHeader();
+                    flushAllEntries();
+                    flushAllFNodes();
+                    zeroAllData();
+                } else {
+                    loadAllEntries();
+                    loadAllFNodes();
                 }
             }
-            throw new Exception("ERROR: file " + fileName + " does not exist");
-        } finally {
-            lock.writeLock().unlock();
-
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to open/initialize disk: " + e.getMessage(), e);
         }
     }
 
-    // ==================== LIST FILES ====================
+    // ======================== Public API (Task 1) ========================
+
+    public void createFile(String filename) throws Exception {
+        rw.writeLock().lock();
+        try {
+            validateName(filename);
+            if (findEntryIndex(filename) >= 0) throw new Exception("file already exists");
+            int slot = findFreeEntryIndex();
+            if (slot < 0) throw new Exception("no free file entries");
+            FEntry e = new FEntry();
+            e.setFilename(filename);
+            e.setUnsignedSize(0);
+            e.setFirstBlock((short)-1);
+            entries[slot] = e;
+            flushEntry(slot);
+        } finally {
+            rw.writeLock().unlock();
+        }
+    }
+
+    public void deleteFile(String filename) throws Exception {
+        rw.writeLock().lock();
+        try {
+            int idx = findEntryIndex(filename);
+            if (idx < 0) throw new Exception("file not found");
+            FEntry e = entries[idx];
+
+            short head = e.getFirstBlock();
+            if (head >= 0) {
+                // zero and free chain
+                var chain = followChain(head);
+                for (short b : chain) zeroBlock(b);
+                freeChain(head);
+                flushAllFNodes();
+            }
+
+            // clear entry
+            entries[idx] = new FEntry();
+            flushEntry(idx);
+        } finally {
+            rw.writeLock().unlock();
+        }
+    }
+
+    public void writeFile(String filename, byte[] contents) throws Exception {
+        rw.writeLock().lock();
+        ArrayList<Short> newly = new ArrayList<>();
+        boolean committed = false;
+        try {
+            int idx = findEntryIndex(filename);
+            if (idx < 0) throw new Exception("file not found");
+            FEntry e = entries[idx];
+
+            // Plan: allocate new chain first (ensures no partial updates); write all data; atomically swap entry; then free old.
+            int newSize = Math.min(contents == null ? 0 : contents.length, 0xFFFF);
+            int neededBlocks = (newSize == 0) ? 0 : (int)Math.ceil((double)newSize / blockSize);
+
+            short newHead = (short)-1;
+            if (neededBlocks > 0) {
+                if (countFreeNodes() < neededBlocks) throw new Exception("insufficient free blocks");
+
+                // allocate and write
+                short prev = -1;
+                int written = 0;
+                for (int i = 0; i < neededBlocks; i++) {
+                    short node = allocFreeNode();
+                    newly.add(node);
+                    // For clarity: node index equals data block index 1:1.
+                    // Mark TEMP end now; we'll fix links as we go.
+                    fnodes[node].setNextIndex(FNode.END);
+
+                    // write data portion
+                    int chunk = Math.min(blockSize, newSize - written);
+                    writeBlock(node, contents, written, chunk);
+                    if (chunk < blockSize) zeroTail(node, chunk);
+                    written += chunk;
+
+                    // chain
+                    if (prev == -1) newHead = node;
+                    else fnodes[prev].setNextIndex(node);
+                    prev = node;
+                }
+            }
+
+            // persist new nodes first, then entry (commit point)
+            flushAllFNodes();
+            short oldHead = e.getFirstBlock();
+            e.setUnsignedSize(newSize);
+            e.setFirstBlock(newHead);
+            flushEntry(idx);
+            committed = true;
+
+            // after commit, free old chain
+            if (oldHead >= 0) {
+                var oldChain = followChain(oldHead);
+                for (short b : oldChain) zeroBlock(b);
+                freeChain(oldHead);
+                flushAllFNodes();
+            }
+        } catch (Exception ex) {
+            // rollback any newly allocated nodes (only if not committed)
+            if (!committed && !newly.isEmpty()) {
+                try {
+                    for (short n : newly) {
+                        zeroBlock(n);
+                        fnodes[n].setNextIndex(FNode.FREE);
+                    }
+                    flushAllFNodes();
+                } catch (IOException ignored) { /* best effort */ }
+            }
+            throw ex;
+        } finally {
+            rw.writeLock().unlock();
+        }
+    }
+
+    public byte[] readFile(String filename) throws Exception {
+        rw.readLock().lock();
+        try {
+            int idx = findEntryIndex(filename);
+            if (idx < 0) throw new Exception("file not found");
+            FEntry e = entries[idx];
+            int size = e.getUnsignedSize();
+            if (size == 0) return new byte[0];
+
+            short cur = e.getFirstBlock();
+            if (cur < 0) throw new Exception("file is corrupt (no head)");
+
+            byte[] out = new byte[size];
+            int off = 0;
+            while (cur >= 0 && off < size) {
+                int chunk = Math.min(blockSize, size - off);
+                readBlock(cur, out, off, chunk);
+                off += chunk;
+                short nx = fnodes[cur].getNextIndex();
+                if (nx == FNode.END) break;
+                if (nx < 0) throw new IOException("corrupt chain");
+                cur = nx;
+            }
+            return out;
+        } finally {
+            rw.readLock().unlock();
+        }
+    }
+
     public String[] listFiles() {
-        lock.readLock().lock();
+        rw.readLock().lock();
         try {
-            java.util.List<String> names = new java.util.ArrayList<>();
-            for (FEntry e : inodeTable)
-                if (e != null)
-                    names.add(e.getFilename());
+            ArrayList<String> names = new ArrayList<>();
+            for (FEntry e : entries) if (e != null && !e.isFree()) names.add(e.getFilename());
             return names.toArray(new String[0]);
         } finally {
-            lock.readLock().unlock();
-
+            rw.readLock().unlock();
         }
     }
 
-    // ==================== HELPERS ====================
-    private FEntry findEntry(String name) {
-        for (FEntry e : inodeTable)
-            if (e != null && e.getFilename().equals(name)) return e;
-        return null;
+    // ======================== helpers & persistence ========================
+
+    private void validateName(String n) throws Exception {
+        if (n == null || n.isBlank()) throw new Exception("invalid filename");
+        if (n.length() > 11) throw new Exception("filename too long (>11)");
     }
 
-    private int countFreeBlocks() {
+    private int findEntryIndex(String name) {
+        for (int i = 0; i < entries.length; i++) {
+            FEntry e = entries[i];
+            if (e != null && !e.isFree() && name.equals(e.getFilename())) return i;
+        }
+        return -1;
+    }
+
+    private int findFreeEntryIndex() {
+        for (int i = 0; i < entries.length; i++) {
+            if (entries[i] == null || entries[i].isFree()) return i;
+        }
+        return -1;
+    }
+
+    private int countFreeNodes() {
         int c = 0;
-        for (boolean b : freeBlockList) if (b) c++;
+        for (FNode n : fnodes) if (n.getNextIndex() == FNode.FREE) c++;
         return c;
     }
 
-    private int getFreeBlock() throws Exception {
-        for (int i = 0; i < MAXBLOCKS; i++)
-            if (freeBlockList[i]) return i;
-        throw new Exception("No free blocks available");
+    private short allocFreeNode() throws Exception {
+        for (short i = 0; i < fnodes.length; i++) {
+            if (fnodes[i].getNextIndex() == FNode.FREE) {
+                fnodes[i].setBlockIndex(i);
+                fnodes[i].setNextIndex(FNode.END); // claimed
+                return i;
+            }
+        }
+        throw new Exception("no free blocks");
     }
 
-    private void clearBlocks(FEntry entry) throws Exception {
-        for (short block : entry.getBlockChain()) {
-            freeBlockList[block] = true;
+    private ArrayList<Short> followChain(short head) throws IOException {
+        ArrayList<Short> list = new ArrayList<>();
+        short cur = head;
+        while (cur >= 0) {
+            list.add(cur);
+            short nx = fnodes[cur].getNextIndex();
+            if (nx == FNode.END) break;
+            if (nx < 0) throw new IOException("corrupt chain");
+            cur = nx;
+        }
+        return list;
+    }
 
-            // Overwrite with zeroes for security
-            disk.seek((long) block * BLOCK_SIZE);
-            byte[] zeros = new byte[BLOCK_SIZE];
+    private void freeChain(short head) {
+        short cur = head;
+        while (cur >= 0) {
+            short nx = fnodes[cur].getNextIndex();
+            fnodes[cur].setNextIndex(FNode.FREE);
+            if (nx == FNode.END) break;
+            cur = nx;
+        }
+    }
+
+    private void writeHeader() throws IOException {
+        ByteBuffer bb = ByteBuffer.allocate(HEADER_BYTES).order(ByteOrder.LITTLE_ENDIAN);
+        bb.putInt(MAGIC);
+        bb.putInt(totalBytes);
+        bb.putInt(blockSize);
+        bb.putInt(maxFiles);
+        bb.putInt(maxBlocks);
+        bb.putInt(0); // reserved
+        disk.seek(0);
+        disk.write(bb.array());
+    }
+
+    private boolean tryLoadHeader() throws IOException {
+        if (disk.length() < HEADER_BYTES) return false;
+        disk.seek(0);
+        byte[] hdr = new byte[HEADER_BYTES];
+        int r = disk.read(hdr);
+        if (r < HEADER_BYTES) return false;
+        ByteBuffer bb = ByteBuffer.wrap(hdr).order(ByteOrder.LITTLE_ENDIAN);
+        int magic = bb.getInt();
+        int tB = bb.getInt();
+        int bS = bb.getInt();
+        int mF = bb.getInt();
+        int mB = bb.getInt();
+        /* reserved */ bb.getInt();
+        return magic == MAGIC && tB == totalBytes && bS == blockSize && mF == maxFiles && mB == maxBlocks;
+    }
+
+    private void flushAllEntries() throws IOException {
+        for (int i = 0; i < maxFiles; i++) flushEntry(i);
+    }
+
+    private void flushEntry(int i) throws IOException {
+        FEntry e = entries[i];
+        if (e == null) e = new FEntry();
+        long pos = entriesOff + (long)i * FENTRY_BYTES;
+        disk.seek(pos);
+
+        // name: 12 bytes ASCII, NUL padded
+        byte[] name = new byte[12];
+        if (!e.isFree()) {
+            byte[] src = e.getFilename().getBytes(StandardCharsets.US_ASCII);
+            int n = Math.min(src.length, 11);
+            System.arraycopy(src, 0, name, 0, n);
+            // trailing zeros already there
+        }
+        disk.write(name);
+
+        // size + firstBlock
+        ByteBuffer mb = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN);
+        mb.putShort((short)(e.getRawSize() & 0xFFFF));
+        mb.putShort(e.getFirstBlock());
+        disk.write(mb.array());
+    }
+
+    private void loadAllEntries() throws IOException {
+        for (int i = 0; i < maxFiles; i++) {
+            long pos = entriesOff + (long)i * FENTRY_BYTES;
+            disk.seek(pos);
+            byte[] name = new byte[12];
+            disk.readFully(name);
+            byte[] meta = new byte[4];
+            disk.readFully(meta);
+            ByteBuffer mb = ByteBuffer.wrap(meta).order(ByteOrder.LITTLE_ENDIAN);
+            short sz = mb.getShort();
+            short first = mb.getShort();
+
+            String nm = new String(name, StandardCharsets.US_ASCII);
+            int nul = nm.indexOf(0);
+            if (nul >= 0) nm = nm.substring(0, nul);
+            nm = nm.trim();
+
+            FEntry e = new FEntry();
+            e.setFilename(nm);
+            e.setUnsignedSize(Short.toUnsignedInt(sz));
+            e.setFirstBlock(first);
+            entries[i] = e;
+        }
+    }
+
+    private void flushAllFNodes() throws IOException {
+        disk.seek(fnodesOff);
+        ByteBuffer bb = ByteBuffer.allocate(FNODE_BYTES * maxBlocks).order(ByteOrder.LITTLE_ENDIAN);
+        for (int i = 0; i < maxBlocks; i++) {
+            short bi = fnodes[i].getBlockIndex();
+            short nx = fnodes[i].getNextIndex();
+            bb.putShort(bi);
+            bb.putShort(nx);
+        }
+        disk.write(bb.array());
+    }
+
+    private void loadAllFNodes() throws IOException {
+        disk.seek(fnodesOff);
+        byte[] raw = new byte[FNODE_BYTES * maxBlocks];
+        disk.readFully(raw);
+        ByteBuffer bb = ByteBuffer.wrap(raw).order(ByteOrder.LITTLE_ENDIAN);
+        for (int i = 0; i < maxBlocks; i++) {
+            short bi = bb.getShort();
+            short nx = bb.getShort();
+            FNode n = new FNode();
+            n.setBlockIndex(bi);
+            n.setNextIndex(nx);
+            fnodes[i] = n;
+        }
+    }
+
+    private void zeroAllData() throws IOException {
+        byte[] zeros = new byte[blockSize];
+        for (int i = 0; i < maxBlocks; i++) {
+            disk.seek(blockPos(i));
             disk.write(zeros);
         }
+    }
 
-        entry.clearBlocks();
+    private void zeroBlock(int blockIndex) throws IOException {
+        byte[] zeros = new byte[blockSize];
+        disk.seek(blockPos(blockIndex));
+        disk.write(zeros);
+    }
+
+    private void zeroTail(int blockIndex, int from) throws IOException {
+        if (from < blockSize) {
+            disk.seek(blockPos(blockIndex) + from);
+            byte[] zeros = new byte[blockSize - from];
+            disk.write(zeros);
+        }
+    }
+
+    private void writeBlock(int blockIndex, byte[] src, int off, int len) throws IOException {
+        disk.seek(blockPos(blockIndex));
+        disk.write(src, off, len);
+    }
+
+    private void readBlock(int blockIndex, byte[] dst, int off, int len) throws IOException {
+        disk.seek(blockPos(blockIndex));
+        disk.readFully(dst, off, len);
+    }
+
+    private long blockPos(int blockIndex) {
+        return dataOff + (long) blockIndex * blockSize;
     }
 }
