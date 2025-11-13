@@ -5,7 +5,12 @@ import ca.concordia.filesystem.FileSystemManager;
 import java.io.*;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 
+/**
+ * Handles exactly one client connection.
+ * Safe with many concurrent instances thanks to FileSystemManager's read/write locks.
+ */
 public class ClientHandler implements Runnable {
 
     private final Socket socket;
@@ -18,39 +23,45 @@ public class ClientHandler implements Runnable {
 
     @Override
     public void run() {
+        String who = socket.getRemoteSocketAddress().toString();
         try (
             BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
             PrintWriter out = new PrintWriter(new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8), true)
         ) {
-            out.println("OK Connected. Commands: CREATE <name>, WRITE <name> <hex>, READ <name>, DELETE <name>, LIST, QUIT");
+            out.println("OK: Connected. Commands: CREATE <name>, WRITE <name> <hex>, READ <name>, DELETE <name>, LIST, QUIT");
+
             String line;
             while ((line = in.readLine()) != null) {
-                if (line.isBlank()) { out.println("ERROR empty command"); continue; }
-                String[] p = line.trim().split("\\s+", 3);
-                String cmd = p[0].toUpperCase();
+                if (line.isBlank()) { out.println("ERROR: empty command"); continue; }
+
+                // Split at most into 3 parts: CMD, arg1, arg2+
+                String[] parts = line.trim().split("\\s+", 3);
+                String cmd = parts[0].toUpperCase();
+
                 try {
                     switch (cmd) {
                         case "CREATE": {
-                            if (p.length < 2) { out.println("ERROR usage: CREATE <filename>"); break; }
-                            fs.createFile(p[1]);
+                            if (parts.length < 2) { out.println("ERROR: usage CREATE <filename>"); break; }
+                            fs.createFile(parts[1]);
                             out.println("OK");
                             break;
                         }
                         case "WRITE": {
-                            if (p.length < 3) { out.println("ERROR usage: WRITE <filename> <hexpayload>"); break; }
-                            fs.writeFile(p[1], hexToBytes(p[2]));
+                            if (parts.length < 3) { out.println("ERROR: usage WRITE <filename> <hexpayload>"); break; }
+                            byte[] data = hexToBytes(parts[2]);
+                            fs.writeFile(parts[1], data);
                             out.println("OK");
                             break;
                         }
                         case "READ": {
-                            if (p.length < 2) { out.println("ERROR usage: READ <filename>"); break; }
-                            byte[] data = fs.readFile(p[1]);
+                            if (parts.length < 2) { out.println("ERROR: usage READ <filename>"); break; }
+                            byte[] data = fs.readFile(parts[1]);
                             out.println("OK " + bytesToHex(data));
                             break;
                         }
                         case "DELETE": {
-                            if (p.length < 2) { out.println("ERROR usage: DELETE <filename>"); break; }
-                            fs.deleteFile(p[1]);
+                            if (parts.length < 2) { out.println("ERROR: usage DELETE <filename>"); break; }
+                            fs.deleteFile(parts[1]);
                             out.println("OK");
                             break;
                         }
@@ -64,16 +75,28 @@ public class ClientHandler implements Runnable {
                             return;
                         }
                         default:
-                            out.println("ERROR unknown command");
+                            out.println("ERROR: unknown command");
                     }
-                } catch (Exception ex) {
-                    out.println("ERROR " + ex.getMessage());
+                } catch (Exception e) {
+                    out.println("ERROR: " + e.getMessage());
                 }
             }
-        } catch (IOException ignore) {
+        } catch (IOException e) {
+            // client disconnected or timed out; just log
+            System.err.println("[Client " + who + "] " + e.getMessage());
         } finally {
-            try { socket.close(); } catch (IOException ignore) {}
-            System.out.println("Client disconnected: " + socket);
+            try { socket.close(); } catch (IOException ignored) {}
+        }
+    }
+
+    // Utility used by FileServer when queue is full
+    static void respondAndClose(Socket s, String msg) {
+        try (OutputStream os = s.getOutputStream();
+             PrintWriter out = new PrintWriter(new OutputStreamWriter(os, StandardCharsets.UTF_8), true)) {
+            out.println(msg);
+        } catch (IOException ignored) {
+        } finally {
+            try { s.close(); } catch (IOException ignored) {}
         }
     }
 
