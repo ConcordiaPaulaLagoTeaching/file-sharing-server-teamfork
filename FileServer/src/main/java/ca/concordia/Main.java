@@ -1,23 +1,30 @@
 package ca.concordia;
 
+import ca.concordia.filesystem.FileSystemManager;
 import ca.concordia.server.FileServer;
+import ca.concordia.server.ServerConfig;
 
 public class Main {
     public static void main(String[] args) {
-        // Example configuration. Change freely — the FS code works with any positive valid values.
-        int PORT        = 12345;
+        // ==== Filesystem sizing (Task 1 parameters, still fully flexible) ====
         String DISK     = "filesystem.dat";
-        int BLOCKSIZE   = 256;   // bytes
-        int MAXFILES    = 128;   // entries
-        int MAXBLOCKS   = 512;   // data blocks
+        int BLOCKSIZE   = 256;   // bytes per block
+        int MAXFILES    = 128;   // number of file entries
+        int MAXBLOCKS   = 1024;  // number of data blocks
 
-        // totalBytes must fit header + entries + fnodes + data
         int totalBytes  = 24                                  // header
                         + MAXFILES * 16                       // entries
                         + MAXBLOCKS * 4                       // fnodes
                         + MAXBLOCKS * BLOCKSIZE;              // data
 
-        FileServer server = new FileServer(PORT, DISK, totalBytes, BLOCKSIZE, MAXFILES, MAXBLOCKS);
-        server.start();
+        FileSystemManager fs = new FileSystemManager(
+                DISK, totalBytes, BLOCKSIZE, MAXFILES, MAXBLOCKS);
+
+        // ==== Multithreaded server config (Task 2) ====
+        int PORT = 12345;
+        ServerConfig cfg = ServerConfig.sensibleDefaults(PORT);
+
+        // Start the multithreaded server (acceptor thread + worker pool)
+        new FileServer(fs, cfg).start();
     }
 }
