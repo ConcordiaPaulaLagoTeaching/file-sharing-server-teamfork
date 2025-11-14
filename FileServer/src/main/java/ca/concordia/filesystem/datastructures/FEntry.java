@@ -1,12 +1,5 @@
 package ca.concordia.filesystem.datastructures;
 
-/**
- * On-disk file entry
- * - filename: <= 11 ASCII chars (12 bytes reserved incl. NUL padding)
- * - size: unsigned short (0..65535)
- * - firstBlock: short index of head node (-1 if none)
- * Exactly 16 bytes on disk.
- */
 public class FEntry {
     private String filename;     // empty => free slot
     private short size;          // store as short; interpret with Short.toUnsignedInt
