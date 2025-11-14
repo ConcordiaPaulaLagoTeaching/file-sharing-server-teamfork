@@ -1,13 +1,5 @@
 package ca.concordia.filesystem.datastructures;
 
-/**
- * On-disk node describing one data block and the link to the next block.
- * Exactly 4 bytes on disk:
- *   blockIndex : short  (0..MAXBLOCKS-1)   // index of the data block
- *   nextIndex  : short  (-1=FREE, -2=END, >=0 next)
- *
- * Each FNode corresponds 1:1 to a data block slot.
- */
 public class FNode {
     public static final short FREE = (short) -1;
     public static final short END  = (short) -2;
